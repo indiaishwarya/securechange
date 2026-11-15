@@ -8,9 +8,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .config import get_settings
-from .database import database_summary, persist_ingestion
-from .github import inspect_github_repository
+from .database import (
+    database_summary,
+    fetch_knowledge_chunks,
+    fetch_scan_history,
+    persist_ingestion,
+    persist_knowledge_chunks,
+    persist_scan_history,
+    persist_security_findings,
+)
+from .evaluation import evaluate_benchmark
+from .github import inspect_github_repository, post_pull_request_comment
+from .impact import build_impact_graph, database_impact
 from .parsers import ingest_repository_files, parse_openapi_contract
+from .retrieval import build_repository_chunks, classify_with_llm, rerank
+from .security import scan_repository
 
 settings = get_settings()
 
@@ -149,6 +161,43 @@ class RepositoryAnalysisResponse(BaseModel):
     api_changes: list[ApiChange]
     breaking_findings: list[BreakingFinding]
     openapi_files: list[str]
+
+
+class ImpactResponse(BaseModel):
+    name: str
+    base_ref: str
+    target_ref: str
+    nodes: list[dict]
+    edges: list[dict]
+    affected_services: list[str]
+    affected_clients: list[str]
+    database_findings: list[dict]
+
+
+class RetrievalIndexRequest(BaseModel):
+    root_path: str
+
+
+class RetrievalSearchRequest(BaseModel):
+    root_path: str
+    query: str
+    top_k: int = 5
+
+
+class FindingExplanationRequest(BaseModel):
+    root_path: str
+    finding: str
+    top_k: int = 5
+
+
+class SecurityScanRequest(BaseModel):
+    root_path: str
+
+
+class PullRequestCommentRequest(BaseModel):
+    repository_url: str
+    pull_number: int
+    body: str
 
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])
@@ -528,4 +577,120 @@ def analyze_repository(request: RepositoryCompareRequest) -> RepositoryAnalysisR
         breaking_findings=breaking_findings,
         openapi_files=openapi_files,
     )
+
+
+@app.post("/api/v1/repositories/impact", response_model=ImpactResponse, tags=["repositories"])
+def repository_impact(request: RepositoryCompareRequest) -> ImpactResponse:
+    repository_root = resolve_repository(request.root_path)
+    comparison = compare_repository(request)
+    base_sha = verify_commit(repository_root, request.base_ref)
+    target_sha = verify_commit(repository_root, request.target_ref)
+    api_changes, _, _ = compare_openapi_contracts(repository_root, base_sha, target_sha)
+    graph = build_impact_graph(
+        run_git,
+        repository_root,
+        base_sha,
+        target_sha,
+        [file.model_dump() for file in comparison.changed_files],
+        [change.model_dump() for change in api_changes],
+    )
+    return ImpactResponse(
+        name=repository_root.name,
+        base_ref=base_sha,
+        target_ref=target_sha,
+        **graph,
+    )
+
+
+@app.post("/api/v1/repositories/retrieval/index", tags=["retrieval"])
+def index_repository(request: RetrievalIndexRequest) -> dict:
+    repository_root = resolve_repository(request.root_path)
+    files = run_git(repository_root, "ls-files").splitlines()
+    chunks = build_repository_chunks(repository_root, files)
+    repository_url = f"file://{repository_root}"
+    count = persist_knowledge_chunks(repository_url, chunks)
+    return {"repository": repository_root.name, "chunks_indexed": count, "embedding_dimensions": 384, "provider": "offline-feature-hash"}
+
+
+@app.post("/api/v1/repositories/retrieval/search", tags=["retrieval"])
+def search_repository(request: RetrievalSearchRequest) -> dict:
+    repository_root = resolve_repository(request.root_path)
+    repository_url = f"file://{repository_root}"
+    rows = fetch_knowledge_chunks(repository_url)
+    if not rows:
+        files = run_git(repository_root, "ls-files").splitlines()
+        rows = build_repository_chunks(repository_root, files)
+        persist_knowledge_chunks(repository_url, rows)
+    results = rerank(request.query, rows, max(1, min(request.top_k, 20)))
+    return {"query": request.query, "results": results, "retrieval": ["bm25", "vector", "score-fusion-reranker"]}
+
+
+@app.post("/api/v1/repositories/retrieval/explain", tags=["retrieval"])
+def explain_finding(request: FindingExplanationRequest) -> dict:
+    repository_root = resolve_repository(request.root_path)
+    repository_url = f"file://{repository_root}"
+    rows = fetch_knowledge_chunks(repository_url)
+    if not rows:
+        files = run_git(repository_root, "ls-files").splitlines()
+        rows = build_repository_chunks(repository_root, files)
+        persist_knowledge_chunks(repository_url, rows)
+    context = rerank(request.finding, rows, max(1, min(request.top_k, 10)))
+    return classify_with_llm(request.finding, context)
+
+
+@app.post("/api/v1/repositories/security/scan", tags=["security"])
+def security_scan(request: SecurityScanRequest) -> dict:
+    repository_root = resolve_repository(request.root_path)
+    files = run_git(repository_root, "ls-files").splitlines()
+    findings, analyzer_status = scan_repository(repository_root, files)
+    repository_url = f"file://{repository_root}"
+    rows = fetch_knowledge_chunks(repository_url)
+    if not rows:
+        rows = build_repository_chunks(repository_root, files)
+    for item in findings:
+        context = rerank(item["message"] + " " + item["rule"], rows, 3)
+        item["explanation"] = classify_with_llm(item["message"], context)
+    persistence_error = None
+    try:
+        persist_security_findings(repository_url, findings)
+    except Exception as error:
+        persistence_error = f"{type(error).__name__}: {error}"
+    try:
+        persist_scan_history(
+            repository_url,
+            "security",
+            "completed",
+            {
+                "finding_count": len(findings),
+                "critical_count": sum(item["severity"] == "critical" for item in findings),
+                "high_count": sum(item["severity"] == "high" for item in findings),
+            },
+        )
+    except Exception as error:
+        persistence_error = persistence_error or f"{type(error).__name__}: {error}"
+    return {
+        "repository": repository_root.name,
+        "analyzer_status": analyzer_status,
+        "findings": findings,
+        "finding_count": len(findings),
+        "critical_count": sum(item["severity"] == "critical" for item in findings),
+        "high_count": sum(item["severity"] == "high" for item in findings),
+        "persistence_error": persistence_error,
+    }
+
+
+@app.post("/api/v1/evaluation/benchmark", tags=["evaluation"])
+def benchmark() -> dict:
+    return evaluate_benchmark()
+
+
+@app.post("/api/v1/repositories/history", tags=["history"])
+def repository_history(request: RepositoryInspectRequest) -> dict:
+    repository_root = resolve_repository(request.root_path)
+    return {"repository": repository_root.name, "history": fetch_scan_history(f"file://{repository_root}")}
+
+
+@app.post("/api/v1/github/pull-requests/comment", tags=["github"])
+def comment_on_pull_request(request: PullRequestCommentRequest) -> dict:
+    return post_pull_request_comment(request.repository_url, request.pull_number, request.body)
 

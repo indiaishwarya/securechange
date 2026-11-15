@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://securechange:securechange_dev@localhost:5432/securechange"
     frontend_origin: str = "http://localhost:5173"
     github_token: str | None = None
+    openai_api_key: str | None = None
+    llm_model: str = "gpt-4o-mini"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

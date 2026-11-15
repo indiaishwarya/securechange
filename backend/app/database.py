@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from datetime import datetime
+import json
 from pathlib import Path
 from typing import Iterator
 from uuid import UUID, uuid4
@@ -115,6 +116,53 @@ def ensure_schema() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                id UUID PRIMARY KEY,
+                repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                chunk_index INT NOT NULL,
+                source_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding vector(384) NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(repository_id, path, chunk_index)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS security_findings (
+                id UUID PRIMARY KEY,
+                repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                analyzer TEXT NOT NULL,
+                rule TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                path TEXT NOT NULL,
+                line INT,
+                message TEXT NOT NULL,
+                explanation JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_history (
+                id UUID PRIMARY KEY,
+                repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                scan_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                finding_count INT NOT NULL DEFAULT 0,
+                critical_count INT NOT NULL DEFAULT 0,
+                high_count INT NOT NULL DEFAULT 0,
+                summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
 
 
 def persist_ingestion(
@@ -183,4 +231,139 @@ def database_summary() -> dict[str, int]:
         scans = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
         pending_reviews = conn.execute("SELECT COUNT(*) FROM pull_requests WHERE state = 'open'").fetchone()[0]
     return {"repositories": repositories, "scans": scans, "critical_findings": 0, "pending_reviews": pending_reviews}
+
+
+def persist_knowledge_chunks(repository_url: str, chunks: list[dict]) -> int:
+    from .retrieval import vector_literal
+
+    ensure_schema()
+    with connection() as conn:
+        row = conn.execute("SELECT id FROM repositories WHERE url = %s", (repository_url,)).fetchone()
+        if row is None:
+            raise ValueError("Inspect the repository before building its retrieval index.")
+        repository_id = row[0]
+        conn.execute("DELETE FROM knowledge_chunks WHERE repository_id = %s", (repository_id,))
+        for chunk in chunks:
+            conn.execute(
+                """
+                INSERT INTO knowledge_chunks
+                    (id, repository_id, path, chunk_index, source_type, content, embedding, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s::jsonb)
+                """,
+                (
+                    uuid4(),
+                    repository_id,
+                    chunk["path"],
+                    chunk["chunk_index"],
+                    chunk["source_type"],
+                    chunk["content"],
+                    vector_literal(chunk["embedding"]),
+                    json.dumps({"indexed_by": "securechange-week5"}),
+                ),
+            )
+    return len(chunks)
+
+
+def fetch_knowledge_chunks(repository_url: str) -> list[dict]:
+    ensure_schema()
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT kc.path, kc.chunk_index, kc.source_type, kc.content,
+                   kc.embedding::text
+            FROM knowledge_chunks kc
+            JOIN repositories r ON r.id = kc.repository_id
+            WHERE r.url = %s
+            ORDER BY kc.path, kc.chunk_index
+            """,
+            (repository_url,),
+        ).fetchall()
+    chunks = []
+    for path, chunk_index, source_type, content, embedding in rows:
+        values = [float(value) for value in embedding.strip("[]").split(",") if value]
+        chunks.append({"path": path, "chunk_index": chunk_index, "source_type": source_type, "content": content, "embedding": values})
+    return chunks
+
+
+def persist_security_findings(repository_url: str, findings: list[dict]) -> int:
+    ensure_schema()
+    with connection() as conn:
+        row = conn.execute("SELECT id FROM repositories WHERE url = %s", (repository_url,)).fetchone()
+        if row is None:
+            raise ValueError("Inspect the repository before running a security scan.")
+        repository_id = row[0]
+        conn.execute("DELETE FROM security_findings WHERE repository_id = %s", (repository_id,))
+        for item in findings:
+            conn.execute(
+                """
+                INSERT INTO security_findings
+                    (id, repository_id, analyzer, rule, severity, path, line, message, explanation)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    uuid4(),
+                    repository_id,
+                    item["analyzer"],
+                    item["rule"],
+                    item["severity"],
+                    item["path"],
+                    item.get("line"),
+                    item["message"],
+                    json.dumps(item.get("explanation", {})),
+                ),
+            )
+    return len(findings)
+
+
+def persist_scan_history(repository_url: str, scan_type: str, status: str, summary: dict) -> None:
+    ensure_schema()
+    with connection() as conn:
+        row = conn.execute("SELECT id FROM repositories WHERE url = %s", (repository_url,)).fetchone()
+        if row is None:
+            raise ValueError("Inspect the repository before recording scan history.")
+        conn.execute(
+            """
+            INSERT INTO scan_history
+                (id, repository_id, scan_type, status, finding_count, critical_count, high_count, summary)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                uuid4(),
+                row[0],
+                scan_type,
+                status,
+                summary.get("finding_count", 0),
+                summary.get("critical_count", 0),
+                summary.get("high_count", 0),
+                json.dumps(summary),
+            ),
+        )
+
+
+def fetch_scan_history(repository_url: str, limit: int = 20) -> list[dict]:
+    ensure_schema()
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT sh.scan_type, sh.status, sh.finding_count, sh.critical_count,
+                   sh.high_count, sh.created_at
+            FROM scan_history sh
+            JOIN repositories r ON r.id = sh.repository_id
+            WHERE r.url = %s
+            ORDER BY sh.created_at DESC
+            LIMIT %s
+            """,
+            (repository_url, limit),
+        ).fetchall()
+    return [
+        {
+            "scan_type": row[0],
+            "status": row[1],
+            "finding_count": row[2],
+            "critical_count": row[3],
+            "high_count": row[4],
+            "created_at": row[5].isoformat(),
+        }
+        for row in rows
+    ]
 

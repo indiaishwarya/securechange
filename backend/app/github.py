@@ -68,3 +68,28 @@ def inspect_github_repository(repository_url: str) -> dict:
         "pull_requests": pull_requests,
     }
 
+
+def post_pull_request_comment(repository_url: str, pull_number: int, body: str) -> dict:
+    owner, name = parse_github_url(repository_url)
+    settings = get_settings()
+    if not settings.github_token:
+        raise HTTPException(status_code=400, detail="GITHUB_TOKEN is required to publish pull-request comments.")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {settings.github_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        response = httpx.post(
+            f"https://api.github.com/repos/{owner}/{name}/issues/{pull_number}/comments",
+            headers=headers,
+            json={"body": body},
+            timeout=20,
+        )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"GitHub comment request failed: {error}") from error
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail="GitHub pull-request comment could not be published.")
+    data = response.json()
+    return {"id": data.get("id"), "url": data.get("html_url"), "body": data.get("body")}
+

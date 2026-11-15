@@ -70,3 +70,35 @@ def test_compare_repository_detects_modified_file(tmp_path: Path) -> None:
     assert analysis["changed_files"][0]["path"] == "service.py"
     assert analysis["breaking_findings"] == []
 
+
+def test_impact_analysis_builds_graph_and_schema_findings(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test User"], check=True)
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "infra" / "db").mkdir(parents=True)
+    (tmp_path / "backend" / "service.py").write_text("def serve():\n    return True\n")
+    schema = tmp_path / "infra" / "db" / "schema.sql"
+    schema.write_text("CREATE TABLE users (id INT);\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "initial"], check=True, capture_output=True)
+    base_sha = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
+
+    schema.write_text("CREATE TABLE accounts (id INT);\n")
+    (tmp_path / "backend" / "service.py").write_text("def serve():\n    return False\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "change service and schema"], check=True, capture_output=True)
+    target_sha = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
+
+    response = client.post(
+        "/api/v1/repositories/impact",
+        json={"root_path": str(tmp_path), "base_ref": base_sha, "target_ref": target_sha},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "service:backend" in {node["id"] for node in data["nodes"]}
+    assert "database:primary" in {node["id"] for node in data["nodes"]}
+    assert data["affected_services"] == ["backend", "infra"]
+    assert any(finding["object"] == "users" and finding["breaking"] for finding in data["database_findings"])
+

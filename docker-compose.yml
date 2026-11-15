@@ -1,0 +1,23 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: securechange-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-securechange}
+      POSTGRES_USER: ${POSTGRES_USER:-securechange}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securechange_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - securechange_pgdata:/var/lib/postgresql/data
+      - ./infra/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  securechange_pgdata:
+

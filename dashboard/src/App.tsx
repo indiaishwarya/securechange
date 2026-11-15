@@ -66,6 +66,50 @@ type Comparison = {
   openapi_files: string[];
 };
 
+type ImpactNode = {
+  id: string;
+  label: string;
+  type: "service" | "api" | "database";
+  affected: boolean;
+};
+
+type Impact = {
+  nodes: ImpactNode[];
+  edges: { source: string; target: string; label: string }[];
+  affected_services: string[];
+  affected_clients: string[];
+  database_findings: { change_type: string; object_type: string; object: string; details: string; breaking: boolean }[];
+};
+
+type RetrievalResult = {
+  path: string;
+  source_type: string;
+  content: string;
+  score: number;
+  bm25_score: number;
+  vector_score: number;
+};
+
+type SecurityFinding = {
+  analyzer: string;
+  rule: string;
+  severity: string;
+  path: string;
+  line?: number;
+  message: string;
+  evidence: string;
+  explanation?: { category?: string; explanation?: string; recommendation?: string; provider?: string };
+};
+
+type ScanHistory = {
+  scan_type: string;
+  status: string;
+  finding_count: number;
+  critical_count: number;
+  high_count: number;
+  created_at: string;
+};
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const initialSummary: Summary = {
   repositories: 0,
@@ -73,6 +117,48 @@ const initialSummary: Summary = {
   critical_findings: 0,
   pending_reviews: 0,
 };
+
+function ImpactGraph({ impact }: { impact: Impact }) {
+  const width = 760;
+  const height = Math.max(220, Math.ceil(impact.nodes.length / 3) * 92);
+  const positions = new Map(impact.nodes.map((node, index) => [
+    node.id,
+    { x: 130 + (index % 3) * 250, y: 48 + Math.floor(index / 3) * 92 },
+  ]));
+  return (
+    <div className="impact-graph">
+      <svg viewBox={"0 0 " + width + " " + height} role="img" aria-label="Service and API dependency graph">
+        <defs>
+          <marker id="impact-arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#6f82a8" />
+          </marker>
+        </defs>
+        {impact.edges.map((edge, index) => {
+          const source = positions.get(edge.source);
+          const target = positions.get(edge.target);
+          if (!source || !target) return null;
+          return <line key={edge.source + edge.target + index} x1={source.x} y1={source.y} x2={target.x} y2={target.y} stroke="#51627f" strokeWidth="1.5" markerEnd="url(#impact-arrow)" />;
+        })}
+        {impact.nodes.map((node) => {
+          const position = positions.get(node.id);
+          if (!position) return null;
+          return (
+            <g key={node.id}>
+              <rect x={position.x - 100} y={position.y - 22} width="200" height="44" rx="9" className={"graph-node graph-" + node.type + (node.affected ? " graph-affected" : "")} />
+              <text x={position.x} y={position.y + 4} textAnchor="middle" className="graph-label">{node.label.length > 25 ? node.label.slice(0, 24) + "…" : node.label}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="graph-legend">
+        <span><i className="legend-swatch graph-service" /> service</span>
+        <span><i className="legend-swatch graph-api" /> API</span>
+        <span><i className="legend-swatch graph-database" /> database</span>
+        <span><i className="legend-swatch graph-affected" /> affected</span>
+      </div>
+    </div>
+  );
+}
 
 export function App() {
   const [summary, setSummary] = useState<Summary>(initialSummary);
@@ -86,6 +172,15 @@ export function App() {
   const [comparison, setComparison] = useState<Comparison | null>(null);
   const [comparisonError, setComparisonError] = useState("");
   const [isComparing, setIsComparing] = useState(false);
+  const [impact, setImpact] = useState<Impact | null>(null);
+  const [retrievalQuery, setRetrievalQuery] = useState("");
+  const [retrievalResults, setRetrievalResults] = useState<RetrievalResult[]>([]);
+  const [retrievalStatus, setRetrievalStatus] = useState("");
+  const [findingExplanation, setFindingExplanation] = useState<Record<string, unknown> | null>(null);
+  const [securityFindings, setSecurityFindings] = useState<SecurityFinding[]>([]);
+  const [securityStatus, setSecurityStatus] = useState("");
+  const [scanHistory, setScanHistory] = useState<ScanHistory[]>([]);
+  const [benchmark, setBenchmark] = useState<Record<string, unknown> | null>(null);
   const [githubUrl, setGithubUrl] = useState("");
   const [githubRepository, setGithubRepository] = useState<GitHubRepository | null>(null);
   const [githubError, setGithubError] = useState("");
@@ -118,6 +213,7 @@ export function App() {
       if (!response.ok) throw new Error(data.detail ?? "Repository inspection failed.");
       setRepository(data);
       setComparison(null);
+      setImpact(null);
       setBaseCommit(data.commits.length > 1 ? data.commits[1].sha : "");
       setTargetCommit(data.commits.length > 0 ? data.commits[0].sha : "");
     } catch (error) {
@@ -141,6 +237,14 @@ export function App() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail ?? "Repository comparison failed.");
       setComparison(data);
+      const impactResponse = await fetch(API_BASE_URL + "/api/v1/repositories/impact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root_path: repositoryPath, base_ref: baseCommit, target_ref: targetCommit }),
+      });
+      const impactData = await impactResponse.json();
+      if (!impactResponse.ok) throw new Error(impactData.detail ?? "Dependency impact analysis failed.");
+      setImpact(impactData);
     } catch (error) {
       setComparisonError(error instanceof Error ? error.message : "Repository comparison failed.");
     } finally {
@@ -166,6 +270,87 @@ export function App() {
     } finally {
       setIsInspectingGithub(false);
     }
+  }
+
+  async function indexRepository() {
+    setRetrievalStatus("Indexing repository...");
+    try {
+      const response = await fetch(API_BASE_URL + "/api/v1/repositories/retrieval/index", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root_path: repositoryPath }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Indexing failed.");
+      setRetrievalStatus(data.chunks_indexed + " chunks indexed");
+    } catch (error) {
+      setRetrievalStatus(error instanceof Error ? error.message : "Indexing failed.");
+    }
+  }
+
+  async function searchRepository(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setRetrievalStatus("Searching...");
+    try {
+      const response = await fetch(API_BASE_URL + "/api/v1/repositories/retrieval/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root_path: repositoryPath, query: retrievalQuery, top_k: 5 }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Search failed.");
+      setRetrievalResults(data.results);
+      setRetrievalStatus(data.results.length + " relevant chunks found");
+    } catch (error) {
+      setRetrievalStatus(error instanceof Error ? error.message : "Search failed.");
+    }
+  }
+
+  async function explainFinding() {
+    if (!retrievalQuery) return;
+    setRetrievalStatus("Classifying finding...");
+    const response = await fetch(API_BASE_URL + "/api/v1/repositories/retrieval/explain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root_path: repositoryPath, finding: retrievalQuery, top_k: 5 }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setRetrievalStatus(data.detail ?? "Explanation failed.");
+      return;
+    }
+    setFindingExplanation(data);
+    setRetrievalStatus("Finding classified with retrieved evidence");
+  }
+
+  async function scanSecurity() {
+    setSecurityStatus("Running security analyzers...");
+    try {
+      const response = await fetch(API_BASE_URL + "/api/v1/repositories/security/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root_path: repositoryPath }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Security scan failed.");
+      setSecurityFindings(data.findings);
+      setSecurityStatus(data.finding_count + " findings · Bandit: " + data.analyzer_status.bandit + " · Semgrep: " + data.analyzer_status.semgrep);
+      const historyResponse = await fetch(API_BASE_URL + "/api/v1/repositories/history", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root_path: repositoryPath }),
+      });
+      const historyData = await historyResponse.json();
+      if (historyResponse.ok) setScanHistory(historyData.history);
+    } catch (error) {
+      setSecurityStatus(error instanceof Error ? error.message : "Security scan failed.");
+    }
+  }
+
+  async function runBenchmark() {
+    const response = await fetch(API_BASE_URL + "/api/v1/evaluation/benchmark", { method: "POST" });
+    const data = await response.json();
+    if (response.ok) setBenchmark(data);
   }
 
   const cards = [
@@ -317,6 +502,30 @@ export function App() {
                 <strong>{comparison.breaking_findings.length ? `${comparison.breaking_findings.length} breaking API finding(s)` : "No obvious breaking API changes"}</strong>
                 <span>{comparison.openapi_files.length ? comparison.openapi_files.join(", ") : "No OpenAPI files found in either commit"}</span>
               </div>
+              {impact && (
+                <div className="impact-panel">
+                  <div className="analysis-section">
+                    <h4>Dependency and impact analysis</h4>
+                    <div className="impact-summary">
+                      <span><strong>{impact.affected_services.length}</strong> affected services</span>
+                      <span><strong>{impact.affected_clients.length}</strong> affected clients</span>
+                      <span><strong>{impact.database_findings.length}</strong> database findings</span>
+                    </div>
+                    <ImpactGraph impact={impact} />
+                  </div>
+                  {impact.database_findings.length > 0 && (
+                    <div className="analysis-section">
+                      <h4>Database-schema impact</h4>
+                      {impact.database_findings.map((finding, index) => (
+                        <div className="finding-row" key={finding.object + "-" + index}>
+                          <span className={"severity-pill " + (finding.breaking ? "" : "severity-review")}>{finding.breaking ? "high" : "review"}</span>
+                          <div><strong>{finding.change_type} {finding.object_type}: {finding.object}</strong><small>{finding.details}</small></div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               {comparison.api_changes.length > 0 && (
                 <div className="analysis-section">
                   <h4>API changes</h4>
@@ -360,6 +569,99 @@ export function App() {
               </div>
             </div>
           )}
+          <section className="retrieval-panel">
+            <div className="retrieval-heading">
+              <div>
+                <p className="eyebrow muted">WEEK 5 RETRIEVAL AND AI</p>
+                <h3>Search engineering evidence</h3>
+                <p>Retrieve relevant code, policies, documentation, and schema context before explaining a finding.</p>
+              </div>
+              <button type="button" className="secondary-button" onClick={indexRepository}>Build retrieval index</button>
+            </div>
+            <form className="retrieval-form" onSubmit={searchRepository}>
+              <input value={retrievalQuery} onChange={(event) => setRetrievalQuery(event.target.value)} placeholder="e.g. database schema migration or removed API response" required />
+              <button type="submit">Search</button>
+              <button type="button" className="secondary-button" onClick={explainFinding} disabled={!retrievalQuery}>Classify and explain</button>
+            </form>
+            {retrievalStatus && <p className="retrieval-status">{retrievalStatus}</p>}
+            {findingExplanation && (
+              <div className="explanation-card">
+                <div className="explanation-topline"><span className="change-pill change-modified">{String(findingExplanation.category ?? "finding")}</span><strong>{String(findingExplanation.severity ?? "review")}</strong></div>
+                <p>{String(findingExplanation.explanation ?? "")}</p>
+                <small>{String(findingExplanation.recommendation ?? "")}</small>
+                <div className="evidence-list">{(Array.isArray(findingExplanation.evidence) ? findingExplanation.evidence : []).map((item, index) => <span className="chip" key={index}>{String((item as { path?: string }).path ?? "evidence")}</span>)}</div>
+              </div>
+            )}
+            {retrievalResults.length > 0 && (
+              <div className="retrieval-results">
+                {retrievalResults.map((result, index) => (
+                  <article className="retrieval-result" key={result.path + "-" + index}>
+                    <div><strong>{result.path}</strong><span>{result.source_type} · score {result.score}</span></div>
+                    <p>{result.content.slice(0, 280)}{result.content.length > 280 ? "…" : ""}</p>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+          <section className="security-panel">
+            <div className="retrieval-heading">
+              <div>
+                <p className="eyebrow muted">WEEK 6 SECURITY ANALYSIS</p>
+                <h3>Scan authentication, authorization, and credentials</h3>
+                <p>Combines SecureChange checks with Bandit, Semgrep, and retrieved evidence.</p>
+              </div>
+              <button type="button" className="security-button" onClick={scanSecurity}>Run security scan</button>
+            </div>
+            {securityStatus && <p className="retrieval-status">{securityStatus}</p>}
+            {securityFindings.length > 0 && (
+              <div className="security-results">
+                {securityFindings.map((finding, index) => (
+                  <article className="security-result" key={finding.rule + finding.path + index}>
+                    <div className="security-result-top">
+                      <span className={"severity-pill severity-" + finding.severity}>{finding.severity}</span>
+                      <strong>{finding.rule}</strong>
+                      <span className="security-analyzer">{finding.analyzer}</span>
+                    </div>
+                    <p>{finding.message}</p>
+                    <small>{finding.path}{finding.line ? ":" + finding.line : ""}</small>
+                    {finding.explanation && (
+                      <div className="security-explanation">
+                        <strong>{finding.explanation.category ?? "security"} · {finding.explanation.provider ?? "retrieval"}</strong>
+                        <span>{finding.explanation.explanation ?? ""}</span>
+                        <small>{finding.explanation.recommendation ?? ""}</small>
+                      </div>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+          <section className="evaluation-panel">
+            <div className="retrieval-heading">
+              <div>
+                <p className="eyebrow muted">WEEK 7 EVALUATION</p>
+                <h3>Benchmark and scan history</h3>
+                <p>Measure detection quality on intentionally seeded bugs and review previous scans.</p>
+              </div>
+              <button type="button" className="secondary-button" onClick={runBenchmark}>Run benchmark</button>
+            </div>
+            {benchmark && (
+              <div className="benchmark-metrics">
+                {Object.entries((benchmark.metrics ?? {}) as Record<string, unknown>).map(([key, value]) => (
+                  <span key={key}><strong>{String(value)}</strong> {key.split("_").join(" ")}</span>
+                ))}
+              </div>
+            )}
+            {scanHistory.length > 0 && (
+              <div className="history-list">
+                {scanHistory.map((item, index) => (
+                  <div className="history-row" key={item.created_at + index}>
+                    <strong>{item.scan_type}</strong><span>{item.finding_count} findings · {item.high_count} high</span><small>{new Date(item.created_at).toLocaleString()}</small>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
           <div className="data-card commits-card">
             <h3>Recent commits</h3>
             {repository.commits.map((commit) => (

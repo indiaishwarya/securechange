@@ -69,3 +69,41 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     UNIQUE(repository_id, number)
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+    id UUID PRIMARY KEY,
+    repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    chunk_index INT NOT NULL,
+    source_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    embedding vector(384) NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(repository_id, path, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS security_findings (
+    id UUID PRIMARY KEY,
+    repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    analyzer TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    path TEXT NOT NULL,
+    line INT,
+    message TEXT NOT NULL,
+    explanation JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scan_history (
+    id UUID PRIMARY KEY,
+    repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    scan_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    finding_count INT NOT NULL DEFAULT 0,
+    critical_count INT NOT NULL DEFAULT 0,
+    high_count INT NOT NULL DEFAULT 0,
+    summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+

@@ -7,4 +7,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
-
+.env
+backend/.venv/
+backend/.security-venv/
+dashboard/node_modules/
+dashboard/dist/
+__pycache__/
+.pytest_cache/

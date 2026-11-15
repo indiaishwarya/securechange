@@ -9,6 +9,8 @@ SecureChange is an AI-assisted engineering analysis platform for detecting break
 - PostgreSQL database with pgvector support
 - Docker Compose database setup
 - Backend tests for the initial API contract
+- Local Git repository inspection endpoint for branches, files, and recent commits
+- Base-versus-target commit comparison with changed-file and diff-context results
 
 ## Local setup
 
@@ -40,4 +42,16 @@ docker compose up -d db
 ```
 
 The dashboard is available at http://localhost:5173 and the API at http://localhost:8000.
+
+## Week 2 repository inspection
+
+With the backend and dashboard running, enter a local Git repository path in the dashboard, such as:
+
+```text
+/Users/your-name/Projects/your-repository
+```
+
+The backend reads the repository using Git's read-only commands and returns its current branch, local branches, tracked files, and 20 recent commits.
+
+After inspection, select two commits in the dashboard and choose **Compare commits**. SecureChange reports added, modified, deleted, and renamed files, line counts, and Git-provided function context for the changed hunks.
 

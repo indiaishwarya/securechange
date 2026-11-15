@@ -60,3 +60,13 @@ def test_compare_repository_detects_modified_file(tmp_path: Path) -> None:
     assert data["additions"] == 1
     assert data["deletions"] == 1
 
+    analysis_response = client.post(
+        "/api/v1/repositories/analyze",
+        json={"root_path": str(tmp_path), "base_ref": base_sha, "target_ref": target_sha},
+    )
+
+    assert analysis_response.status_code == 200
+    analysis = analysis_response.json()
+    assert analysis["changed_files"][0]["path"] == "service.py"
+    assert analysis["breaking_findings"] == []
+

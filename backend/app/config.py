@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+psycopg://securechange:securechange_dev@localhost:5432/securechange"
     frontend_origin: str = "http://localhost:5173"
+    github_token: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

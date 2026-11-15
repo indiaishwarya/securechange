@@ -11,6 +11,11 @@ SecureChange is an AI-assisted engineering analysis platform for detecting break
 - Backend tests for the initial API contract
 - Local Git repository inspection endpoint for branches, files, and recent commits
 - Base-versus-target commit comparison with changed-file and diff-context results
+- PostgreSQL persistence for repositories, commits, files, symbols, API endpoints, scans, and pull requests
+- Python/JavaScript/TypeScript source-symbol parsing
+- OpenAPI and Swagger endpoint extraction
+- GitHub repository, commit, and pull-request inspection
+- Commit analysis with API-change classification and obvious breaking-change detection
 
 ## Local setup
 
@@ -54,4 +59,8 @@ With the backend and dashboard running, enter a local Git repository path in the
 The backend reads the repository using Git's read-only commands and returns its current branch, local branches, tracked files, and 20 recent commits.
 
 After inspection, select two commits in the dashboard and choose **Compare commits**. SecureChange reports added, modified, deleted, and renamed files, line counts, and Git-provided function context for the changed hunks.
+
+To connect a public GitHub repository, use the GitHub connector in the dashboard. For private repositories, set `GITHUB_TOKEN` in `.env` before starting the backend.
+
+After selecting a base and target commit, choose **Compare commits** to run the Week 3 analysis. The result includes changed files, changed symbols, OpenAPI additions/removals/modifications, and breaking rules such as removed endpoints, newly required parameters, removed response codes, and newly required request bodies.
 

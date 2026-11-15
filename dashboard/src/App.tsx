@@ -23,6 +23,20 @@ type Repository = {
   branches: string[];
   files: string[];
   commits: Commit[];
+  symbol_count: number;
+  api_endpoint_count: number;
+  persisted: boolean;
+};
+
+type GitHubRepository = {
+  name: string;
+  url: string;
+  default_branch: string;
+  description: string | null;
+  stars: number;
+  commits: Commit[];
+  pull_requests: { number: number; title: string; state: string; author?: string; url?: string }[];
+  persisted: boolean;
 };
 
 type ChangedFile = {
@@ -46,6 +60,10 @@ type Comparison = {
   deleted_files: number;
   renamed_files: number;
   changed_files: ChangedFile[];
+  changed_functions: string[];
+  api_changes: { change_type: string; method: string; path: string; details: string[]; breaking: boolean }[];
+  breaking_findings: { severity: string; rule: string; method: string; path: string; details: string }[];
+  openapi_files: string[];
 };
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
@@ -68,6 +86,10 @@ export function App() {
   const [comparison, setComparison] = useState<Comparison | null>(null);
   const [comparisonError, setComparisonError] = useState("");
   const [isComparing, setIsComparing] = useState(false);
+  const [githubUrl, setGithubUrl] = useState("");
+  const [githubRepository, setGithubRepository] = useState<GitHubRepository | null>(null);
+  const [githubError, setGithubError] = useState("");
+  const [isInspectingGithub, setIsInspectingGithub] = useState(false);
 
   useEffect(() => {
     Promise.all([
@@ -111,7 +133,7 @@ export function App() {
     setIsComparing(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/repositories/compare`, {
+      const response = await fetch(`${API_BASE_URL}/api/v1/repositories/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ root_path: repositoryPath, base_ref: baseCommit, target_ref: targetCommit }),
@@ -123,6 +145,26 @@ export function App() {
       setComparisonError(error instanceof Error ? error.message : "Repository comparison failed.");
     } finally {
       setIsComparing(false);
+    }
+  }
+
+  async function inspectGithub(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setGithubError("");
+    setIsInspectingGithub(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/github/inspect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repository_url: githubUrl }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "GitHub repository inspection failed.");
+      setGithubRepository(data);
+    } catch (error) {
+      setGithubError(error instanceof Error ? error.message : "GitHub repository inspection failed.");
+    } finally {
+      setIsInspectingGithub(false);
     }
   }
 
@@ -167,6 +209,36 @@ export function App() {
         </form>
       </section>
 
+      <section className="github-panel">
+        <div>
+          <p className="eyebrow muted">GITHUB CONNECTOR</p>
+          <h2>Inspect a GitHub repository</h2>
+          <p>Load repository metadata, commits, and pull requests through the GitHub API.</p>
+        </div>
+        <form className="github-form" onSubmit={inspectGithub}>
+          <input
+            value={githubUrl}
+            onChange={(event) => setGithubUrl(event.target.value)}
+            placeholder="https://github.com/owner/repository"
+            aria-label="GitHub repository URL"
+            required
+          />
+          <button type="submit" disabled={isInspectingGithub}>
+            {isInspectingGithub ? "Loading..." : "Connect GitHub"}
+          </button>
+        </form>
+        {githubError && <div className="error-banner">{githubError}</div>}
+        {githubRepository && (
+          <div className="github-result">
+            <div>
+              <strong>{githubRepository.name}</strong>
+              <p>{githubRepository.description || "No description provided."}</p>
+            </div>
+            <span>{githubRepository.commits.length} commits · {githubRepository.pull_requests.length} pull requests</span>
+          </div>
+        )}
+      </section>
+
       {repositoryError && <div className="error-banner">{repositoryError}</div>}
 
       {repository && (
@@ -190,6 +262,16 @@ export function App() {
               <h3>Files</h3>
               <strong className="large-number">{repository.files.length}</strong>
               <p>tracked files detected</p>
+            </div>
+            <div className="data-card">
+              <h3>Source symbols</h3>
+              <strong className="large-number">{repository.symbol_count}</strong>
+              <p>functions and classes parsed</p>
+            </div>
+            <div className="data-card">
+              <h3>OpenAPI endpoints</h3>
+              <strong className="large-number">{repository.api_endpoint_count}</strong>
+              <p>operations extracted</p>
             </div>
           </div>
           <form className="compare-form" onSubmit={compareRepository}>
@@ -231,6 +313,39 @@ export function App() {
                 <span><strong>{comparison.deleted_files}</strong> deleted</span>
                 <span><strong>{comparison.renamed_files}</strong> renamed</span>
               </div>
+              <div className={`analysis-banner ${comparison.breaking_findings.length ? "has-breaking" : "clean"}`}>
+                <strong>{comparison.breaking_findings.length ? `${comparison.breaking_findings.length} breaking API finding(s)` : "No obvious breaking API changes"}</strong>
+                <span>{comparison.openapi_files.length ? comparison.openapi_files.join(", ") : "No OpenAPI files found in either commit"}</span>
+              </div>
+              {comparison.api_changes.length > 0 && (
+                <div className="analysis-section">
+                  <h4>API changes</h4>
+                  {comparison.api_changes.map((change) => (
+                    <div className="api-change-row" key={`${change.change_type}-${change.method}-${change.path}`}>
+                      <span className={`change-pill change-${change.change_type}`}>{change.change_type}</span>
+                      <strong>{change.method} {change.path}</strong>
+                      <small>{change.details.join(" ")}</small>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {comparison.breaking_findings.length > 0 && (
+                <div className="analysis-section">
+                  <h4>Breaking findings</h4>
+                  {comparison.breaking_findings.map((finding, index) => (
+                    <div className="finding-row" key={`${finding.rule}-${finding.path}-${index}`}>
+                      <span className="severity-pill">{finding.severity}</span>
+                      <div><strong>{finding.method} {finding.path}</strong><small>{finding.details}</small></div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {comparison.changed_functions.length > 0 && (
+                <div className="analysis-section">
+                  <h4>Changed functions and symbols</h4>
+                  <div className="symbol-list">{comparison.changed_functions.map((symbol) => <span className="chip" key={symbol}>{symbol}</span>)}</div>
+                </div>
+              )}
               <div className="changed-files">
                 {comparison.changed_files.map((file) => (
                   <div className="changed-file-row" key={`${file.status}-${file.path}`}>

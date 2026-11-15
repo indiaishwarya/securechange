@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .config import get_settings
+from .database import database_summary, persist_ingestion
+from .github import inspect_github_repository
+from .parsers import ingest_repository_files, parse_openapi_contract
 
 settings = get_settings()
 
@@ -51,6 +54,26 @@ class RepositoryInspectResponse(BaseModel):
     branches: list[str]
     files: list[str]
     commits: list[CommitSummary]
+    symbol_count: int = 0
+    api_endpoint_count: int = 0
+    persisted: bool = False
+    persistence_error: str | None = None
+
+
+class GitHubInspectRequest(BaseModel):
+    repository_url: str
+
+
+class GitHubInspectResponse(BaseModel):
+    name: str
+    url: str
+    default_branch: str
+    description: str | None
+    stars: int
+    commits: list[CommitSummary]
+    pull_requests: list[dict]
+    persisted: bool = False
+    persistence_error: str | None = None
 
 
 class RepositoryCompareRequest(BaseModel):
@@ -93,6 +116,41 @@ class RepositoryCompareResponse(BaseModel):
     changed_files: list[ChangedFile]
 
 
+class ApiChange(BaseModel):
+    change_type: str
+    method: str
+    path: str
+    source_file: str | None = None
+    details: list[str]
+    breaking: bool = False
+
+
+class BreakingFinding(BaseModel):
+    severity: str
+    rule: str
+    method: str
+    path: str
+    details: str
+
+
+class RepositoryAnalysisResponse(BaseModel):
+    name: str
+    base_ref: str
+    target_ref: str
+    files_changed: int
+    additions: int
+    deletions: int
+    added_files: int
+    modified_files: int
+    deleted_files: int
+    renamed_files: int
+    changed_files: list[ChangedFile]
+    changed_functions: list[str]
+    api_changes: list[ApiChange]
+    breaking_findings: list[BreakingFinding]
+    openapi_files: list[str]
+
+
 @app.get("/health", response_model=HealthResponse, tags=["system"])
 def health() -> HealthResponse:
     return HealthResponse(
@@ -104,12 +162,10 @@ def health() -> HealthResponse:
 
 @app.get("/api/v1/summary", tags=["dashboard"])
 def summary() -> dict[str, int]:
-    return {
-        "repositories": 0,
-        "scans": 0,
-        "critical_findings": 0,
-        "pending_reviews": 0,
-    }
+    try:
+        return database_summary()
+    except Exception:
+        return {"repositories": 0, "scans": 0, "critical_findings": 0, "pending_reviews": 0}
 
 
 def run_git(root_path: Path, *arguments: str) -> str:
@@ -245,6 +301,25 @@ def inspect_repository(request: RepositoryInspectRequest) -> RepositoryInspectRe
             )
         )
 
+    symbols, endpoints = ingest_repository_files(repository_root, file_output.splitlines())
+    persisted = False
+    persistence_error = None
+    try:
+        persist_ingestion(
+            name=repository_root.name,
+            provider="local",
+            url=f"file://{repository_root}",
+            commits=[commit.model_dump() for commit in commits],
+            files=file_output.splitlines(),
+            symbols=symbols,
+            endpoints=endpoints,
+        )
+        persisted = True
+    except Exception as error:
+        persistence_error = f"{type(error).__name__}: {error}"
+        print(f"Repository persistence failed: {persistence_error}")
+        persisted = False
+
     return RepositoryInspectResponse(
         name=repository_root.name,
         root_path=str(repository_root),
@@ -252,6 +327,45 @@ def inspect_repository(request: RepositoryInspectRequest) -> RepositoryInspectRe
         branches=branch_output.splitlines(),
         files=file_output.splitlines(),
         commits=commits,
+        symbol_count=len(symbols),
+        api_endpoint_count=len(endpoints),
+        persisted=persisted,
+        persistence_error=persistence_error,
+    )
+
+
+@app.post("/api/v1/github/inspect", response_model=GitHubInspectResponse, tags=["github"])
+def inspect_github(request: GitHubInspectRequest) -> GitHubInspectResponse:
+    data = inspect_github_repository(request.repository_url)
+    commits = [CommitSummary(**commit) for commit in data["commits"]]
+    persisted = False
+    persistence_error = None
+    try:
+        persist_ingestion(
+            name=data["name"].split("/")[-1],
+            provider="github",
+            url=data["url"],
+            commits=data["commits"],
+            files=[],
+            symbols=[],
+            endpoints=[],
+            pull_requests=data["pull_requests"],
+        )
+        persisted = True
+    except Exception as error:
+        persistence_error = f"{type(error).__name__}: {error}"
+        print(f"GitHub persistence failed: {persistence_error}")
+        persisted = False
+    return GitHubInspectResponse(
+        name=data["name"],
+        url=data["url"],
+        default_branch=data["default_branch"],
+        description=data["description"],
+        stars=data["stars"],
+        commits=commits,
+        pull_requests=data["pull_requests"],
+        persisted=persisted,
+        persistence_error=persistence_error,
     )
 
 
@@ -318,5 +432,100 @@ def compare_repository(request: RepositoryCompareRequest) -> RepositoryCompareRe
         deleted_files=status_counts.get("D", 0),
         renamed_files=status_counts.get("R", 0),
         changed_files=changed_files,
+    )
+
+
+def openapi_files_at_ref(repository_root: Path, ref: str) -> list[str]:
+    files = run_git(repository_root, "ls-tree", "-r", "--name-only", ref).splitlines()
+    return [
+        path for path in files
+        if Path(path).name.lower() in {"openapi.yaml", "openapi.yml", "openapi.json", "swagger.yaml", "swagger.yml", "swagger.json"}
+    ]
+
+
+def openapi_contract_at_ref(repository_root: Path, ref: str) -> tuple[list[str], dict[tuple[str, str], dict]]:
+    file_paths = openapi_files_at_ref(repository_root, ref)
+    contract: dict[tuple[str, str], dict] = {}
+    for path in file_paths:
+        try:
+            content = run_git(repository_root, "show", f"{ref}:{path}")
+        except HTTPException:
+            continue
+        for endpoint in parse_openapi_contract(path, content):
+            contract[(endpoint["method"], endpoint["path"])] = endpoint
+    return file_paths, contract
+
+
+def compare_openapi_contracts(repository_root: Path, base_ref: str, target_ref: str) -> tuple[list[ApiChange], list[BreakingFinding], list[str]]:
+    base_files, base_contract = openapi_contract_at_ref(repository_root, base_ref)
+    target_files, target_contract = openapi_contract_at_ref(repository_root, target_ref)
+    api_changes: list[ApiChange] = []
+    breaking_findings: list[BreakingFinding] = []
+    keys = sorted(set(base_contract) | set(target_contract))
+
+    for key in keys:
+        method, path = key
+        before = base_contract.get(key)
+        after = target_contract.get(key)
+        source_file = (after or before).get("source_file")
+        if before is None:
+            api_changes.append(ApiChange(change_type="added", method=method, path=path, source_file=source_file, details=["Endpoint was added."], breaking=False))
+            continue
+        if after is None:
+            details = ["Endpoint was removed from the target contract."]
+            api_changes.append(ApiChange(change_type="removed", method=method, path=path, source_file=source_file, details=details, breaking=True))
+            breaking_findings.append(BreakingFinding(severity="critical", rule="endpoint_removed", method=method, path=path, details=details[0]))
+            continue
+
+        details: list[str] = []
+        before_parameters = {(item.get("name"), item.get("in")): item for item in before.get("parameters", [])}
+        after_parameters = {(item.get("name"), item.get("in")): item for item in after.get("parameters", [])}
+        for parameter_key, parameter in after_parameters.items():
+            if parameter.get("required") and not before_parameters.get(parameter_key, {}).get("required"):
+                details.append(f"Parameter {parameter_key[0]} became required.")
+                breaking_findings.append(BreakingFinding(severity="high", rule="required_parameter_added", method=method, path=path, details=details[-1]))
+        before_responses = set(before.get("responses", []))
+        after_responses = set(after.get("responses", []))
+        removed_responses = sorted(before_responses - after_responses)
+        if removed_responses:
+            details.append(f"Response status codes removed: {', '.join(removed_responses)}.")
+            breaking_findings.append(BreakingFinding(severity="high", rule="response_removed", method=method, path=path, details=details[-1]))
+        if after.get("request_body_required") and not before.get("request_body_required"):
+            details.append("Request body became required.")
+            breaking_findings.append(BreakingFinding(severity="high", rule="required_request_body", method=method, path=path, details=details[-1]))
+        if before.get("operation_id") != after.get("operation_id"):
+            details.append("Operation ID changed.")
+        if before.get("summary") != after.get("summary"):
+            details.append("Summary or description changed.")
+        if details:
+            api_changes.append(ApiChange(change_type="modified", method=method, path=path, source_file=source_file, details=details, breaking=any(f.path == path and f.method == method for f in breaking_findings)))
+
+    return api_changes, breaking_findings, sorted(set(base_files + target_files))
+
+
+@app.post("/api/v1/repositories/analyze", response_model=RepositoryAnalysisResponse, tags=["repositories"])
+def analyze_repository(request: RepositoryCompareRequest) -> RepositoryAnalysisResponse:
+    comparison = compare_repository(request)
+    base_sha = verify_commit(resolve_repository(request.root_path), request.base_ref)
+    target_sha = verify_commit(resolve_repository(request.root_path), request.target_ref)
+    repository_root = resolve_repository(request.root_path)
+    api_changes, breaking_findings, openapi_files = compare_openapi_contracts(repository_root, base_sha, target_sha)
+    changed_functions = sorted({symbol for file in comparison.changed_files for hunk in file.hunks for symbol in hunk.symbols})
+    return RepositoryAnalysisResponse(
+        name=repository_root.name,
+        base_ref=base_sha,
+        target_ref=target_sha,
+        files_changed=comparison.files_changed,
+        additions=comparison.additions,
+        deletions=comparison.deletions,
+        added_files=comparison.added_files,
+        modified_files=comparison.modified_files,
+        deleted_files=comparison.deleted_files,
+        renamed_files=comparison.renamed_files,
+        changed_files=comparison.changed_files,
+        changed_functions=changed_functions,
+        api_changes=api_changes,
+        breaking_findings=breaking_findings,
+        openapi_files=openapi_files,
     )
 

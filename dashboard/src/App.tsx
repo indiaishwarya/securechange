@@ -348,9 +348,14 @@ export function App() {
   }
 
   async function runBenchmark() {
-    const response = await fetch(API_BASE_URL + "/api/v1/evaluation/benchmark", { method: "POST" });
-    const data = await response.json();
-    if (response.ok) setBenchmark(data);
+    try {
+      const response = await fetch(API_BASE_URL + "/api/v1/evaluation/benchmark", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail ?? "Benchmark failed.");
+      setBenchmark(data);
+    } catch (error) {
+      setRepositoryError(error instanceof Error ? error.message : "Benchmark failed.");
+    }
   }
 
   const cards = [
@@ -373,8 +378,14 @@ export function App() {
           {apiStatus}
         </div>
       </header>
+      <nav className="section-nav" aria-label="Dashboard sections">
+        <a href="#repository">Repository</a>
+        <a href="#retrieval">Retrieval and AI</a>
+        <a href="#security">Security</a>
+        <a href="#evaluation">Evaluation</a>
+      </nav>
 
-      <section className="hero-panel">
+      <section className="hero-panel" id="repository">
         <div>
           <p className="eyebrow muted">WEEK 1 FOUNDATION</p>
           <h2>Your engineering risk overview</h2>
@@ -569,7 +580,7 @@ export function App() {
               </div>
             </div>
           )}
-          <section className="retrieval-panel">
+          <section className="retrieval-panel" id="retrieval">
             <div className="retrieval-heading">
               <div>
                 <p className="eyebrow muted">WEEK 5 RETRIEVAL AND AI</p>
@@ -603,7 +614,7 @@ export function App() {
               </div>
             )}
           </section>
-          <section className="security-panel">
+          <section className="security-panel" id="security">
             <div className="retrieval-heading">
               <div>
                 <p className="eyebrow muted">WEEK 6 SECURITY ANALYSIS</p>
@@ -636,7 +647,7 @@ export function App() {
               </div>
             )}
           </section>
-          <section className="evaluation-panel">
+          <section className="evaluation-panel" id="evaluation">
             <div className="retrieval-heading">
               <div>
                 <p className="eyebrow muted">WEEK 7 EVALUATION</p>
@@ -686,8 +697,8 @@ export function App() {
 
       <section className="empty-state">
         <div className="empty-icon">⌁</div>
-        <h2>No scans yet</h2>
-        <p>{repository ? "Repository files and commits are ready for change analysis." : "Enter a local Git repository path above to begin ingestion."}</p>
+        <h2>{repository ? "Repository ready for review" : "Start with a repository"}</h2>
+        <p>{repository ? "Use the sections above to compare commits, retrieve evidence, run security checks, and review evaluation history." : "Enter a local Git repository path above to begin ingestion."}</p>
       </section>
     </main>
   );

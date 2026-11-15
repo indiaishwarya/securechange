@@ -92,3 +92,7 @@ Use Run security scan to detect possible missing authorization on web routes, ha
 
 The benchmark endpoint evaluates the intentionally vulnerable and secure fixtures under benchmark/fixtures. It reports precision, recall, F1, Recall@3, and false-positive rate. The GitHub Actions workflow runs tests, the benchmark, Bandit, and Semgrep on pushes and pull requests, uploads analyzer reports, and comments a CI summary on pull requests. Security scans are persisted in scan_history and displayed in the dashboard.
 
+## Week 8 polish and deployment
+
+The API exposes `/health` for liveness, `/ready` for database readiness, and `/metrics` for lightweight request counters. Requests receive an `X-Request-ID`, validation and unexpected failures use consistent JSON error responses, and the dashboard includes responsive section navigation, clearer empty states, and accessible focus styles. `backend/Dockerfile`, `dashboard/Dockerfile`, `dashboard/nginx.conf`, and `docker-compose.production.yml` provide a production-shaped container deployment. See `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `docs/RESUME_BULLETS.md` for the architecture, operations, and resume-ready outcomes. The demo video is intentionally deferred.
+

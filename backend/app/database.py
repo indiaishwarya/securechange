@@ -228,7 +228,9 @@ def database_summary() -> dict[str, int]:
     ensure_schema()
     with connection() as conn:
         repositories = conn.execute("SELECT COUNT(*) FROM repositories").fetchone()[0]
-        scans = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+        scans = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM scans) + (SELECT COUNT(*) FROM scan_history)"
+        ).fetchone()[0]
         pending_reviews = conn.execute("SELECT COUNT(*) FROM pull_requests WHERE state = 'open'").fetchone()[0]
     return {"repositories": repositories, "scans": scans, "critical_findings": 0, "pending_reviews": pending_reviews}
 

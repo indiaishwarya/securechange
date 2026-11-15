@@ -14,6 +14,24 @@ def test_health_check() -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.headers["x-request-id"]
+
+
+def test_metrics_endpoint_reports_requests() -> None:
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["requests_total"] >= 1
+    assert "status_codes" in data
+
+
+def test_validation_errors_are_json() -> None:
+    response = client.post("/api/v1/repositories/inspect", json={})
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "validation_error"
+    assert response.json()["request_id"]
 
 
 def test_summary_starts_empty() -> None:

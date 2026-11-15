@@ -1,11 +1,16 @@
 import subprocess
 import re
+import time
+from uuid import uuid4
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 from .config import get_settings
 from .database import (
@@ -20,6 +25,7 @@ from .database import (
 from .evaluation import evaluate_benchmark
 from .github import inspect_github_repository, post_pull_request_comment
 from .impact import build_impact_graph, database_impact
+from .monitoring import metrics
 from .parsers import ingest_repository_files, parse_openapi_contract
 from .retrieval import build_repository_chunks, classify_with_llm, rerank
 from .security import scan_repository
@@ -39,6 +45,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RequestMetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        started = time.perf_counter()
+        metrics.begin()
+        try:
+            response = await call_next(request)
+        except Exception:
+            metrics.finish(request.url.path, 500)
+            raise
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Response-Time-Ms"] = str(round((time.perf_counter() - started) * 1000, 2))
+        metrics.finish(request.url.path, response.status_code)
+        return response
+
+
+app.add_middleware(RequestMetricsMiddleware)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    return JSONResponse(
+        status_code=422,
+        content={"error": "validation_error", "detail": exc.errors(), "request_id": request_id},
+        headers={"X-Request-ID": request_id},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    print(f"Unhandled request error request_id={request_id} error={type(exc).__name__}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_server_error", "detail": "An unexpected server error occurred.", "request_id": request_id},
+        headers={"X-Request-ID": request_id},
+    )
 
 
 class HealthResponse(BaseModel):
@@ -207,6 +253,24 @@ def health() -> HealthResponse:
         service=settings.app_name,
         timestamp=datetime.now(UTC),
     )
+
+
+@app.get("/ready", tags=["system"])
+def readiness() -> dict[str, str]:
+    """Readiness probe: the process is ready only when the database is reachable."""
+    try:
+        from .database import connection
+
+        with connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Database is not ready: {type(error).__name__}") from error
+    return {"status": "ready", "service": settings.app_name}
+
+
+@app.get("/metrics", tags=["system"])
+def application_metrics() -> dict:
+    return metrics.snapshot()
 
 
 @app.get("/api/v1/summary", tags=["dashboard"])
